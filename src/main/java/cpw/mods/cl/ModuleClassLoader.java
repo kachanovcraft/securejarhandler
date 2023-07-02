@@ -28,26 +28,30 @@ public class ModuleClassLoader extends ClassLoader {
     private final Map<String, ResolvedModule> packageLookup;
     private final Map<String, ClassLoader> parentLoaders;
     private ClassLoader fallbackClassLoader = ClassLoader.getPlatformClassLoader();
+    private static final ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
 
     public ModuleClassLoader(final String name, final Configuration configuration, final List<ModuleLayer> parentLayers) {
         super(name, null);
         this.configuration = configuration;
-        record JarRef(ResolvedModule m, JarModuleFinder.JarModuleReference ref) {}
         this.resolvedRoots = configuration.modules().stream()
-                .filter(m->m.reference() instanceof JarModuleFinder.JarModuleReference)
-                .map(m->new JarRef(m, (JarModuleFinder.JarModuleReference)m.reference()))
-                .collect(Collectors.toMap(r->r.m().name(), JarRef::ref));
+                .map(ResolvedModule::reference)
+                .filter(JarModuleFinder.JarModuleReference.class::isInstance)
+                .collect(Collectors.toMap(r -> r.descriptor().name(), r -> (JarModuleFinder.JarModuleReference) r));
 
         this.packageLookup = new HashMap<>();
         for (var mod : this.configuration.modules()) {
-            mod.reference().descriptor().packages().forEach(pk->this.packageLookup.put(pk, mod));
+            if (this.resolvedRoots.containsKey(mod.name())) {
+                mod.reference().descriptor().packages().forEach(pk->this.packageLookup.put(pk, mod));
+            }
         }
 
         this.parentLoaders = new HashMap<>();
         for (var rm : configuration.modules()) {
             for (var other : rm.reads()) {
                 Supplier<ClassLoader> findClassLoader = ()->{
-                    if (other.configuration() != configuration) {
+                    // Loading a class requires its module to be part of resolvedRoots
+                    // If it's not, we delegate loading to its module's classloader
+                    if (!this.resolvedRoots.containsKey(other.name())) {
                         return parentLayers.stream()
                                 .filter(l -> l.configuration() == other.configuration())
                                 .flatMap(layer->Optional.ofNullable(layer.findLoader(other.name())).stream())
@@ -130,6 +134,8 @@ public class ModuleClassLoader extends ClassLoader {
                     final var pname = name.substring(0, index);
                     if (this.packageLookup.containsKey(pname)) {
                         c = findClass(this.packageLookup.get(pname).name(), name);
+                    } else if(name.contains("pro.gravit.launcher") || name.contains("pro.gravit.utils")) {
+                        c = systemClassLoader.loadClass(name);
                     } else {
                         c = this.parentLoaders.getOrDefault(pname, fallbackClassLoader).loadClass(name);
                     }
@@ -167,7 +173,7 @@ public class ModuleClassLoader extends ClassLoader {
             if (!reslist.isEmpty()) {
                 return reslist.get(0);
             } else {
-                return null;
+                return fallbackClassLoader.getResource(name);
             }
         } catch (IOException e) {
             return null;
@@ -227,22 +233,30 @@ public class ModuleClassLoader extends ClassLoader {
         }
     }
 
-    protected byte[] getMaybeTransformedClassBytes(final String name, final String context) {
+    protected byte[] getMaybeTransformedClassBytes(final String name, final String context) throws ClassNotFoundException {
         byte[] bytes = new byte[0];
+        Throwable suppressed = null;
         try {
             final var pname = name.substring(0, name.lastIndexOf('.'));
             if (this.packageLookup.containsKey(pname)) {
                 bytes = loadFromModule(classNameToModuleName(name), (reader, ref)->this.getClassBytes(reader, ref, name));
-            } else {
+            } else if (this.parentLoaders.containsKey(pname)) {
                 var cname = name.replace('.','/')+".class";
-                try (var is = this.parentLoaders.getOrDefault(pname, ClassLoader.getPlatformClassLoader()).getResourceAsStream(cname)) {
+                try (var is = this.parentLoaders.get(pname).getResourceAsStream(cname)) {
                     if (is != null)
                         bytes = is.readAllBytes();
                 }
             }
-        } catch (IOException ignored) {
+        } catch (IOException e) {
+            suppressed = e;
         }
-        return maybeTransformClassBytes(bytes, name, context);
+        byte[] maybeTransformedBytes = maybeTransformClassBytes(bytes, name, context);
+        if (maybeTransformedBytes.length == 0) {
+            ClassNotFoundException e = new ClassNotFoundException(name);
+            if (suppressed != null) e.addSuppressed(suppressed);
+            throw e;
+        }
+        return maybeTransformedBytes;
     }
 
     public void setFallbackClassLoader(final ClassLoader fallbackClassLoader) {
